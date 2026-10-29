@@ -62,6 +62,7 @@ type endpoint struct {
 	lastRecvWG            mono.Time // last time there were incoming packets from this peer destined for wireguard-go (e.g. not disco)
 	lastRecvUDPAny        mono.Time // last time there were incoming UDP packets from this peer of any kind
 	numStopAndResetAtomic int64
+	connectedUDPTxBytes   atomic.Int64 // bytes sent on a direct path since the last heartbeat; see connected_udp.go
 	debugUpdates          *ringlog.RingLog[EndpointChange]
 
 	// These fields are initialized once and never modified.
@@ -95,6 +96,15 @@ type endpoint struct {
 	sentPing           map[stun.TxID]sentPing
 	endpointState      map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
 	isCallMeMaybeEP    map[netip.AddrPort]bool
+
+	// connectedSocket is a socket connected to bestAddr, opened once this
+	// peer is busy enough, or nil. connectedUDPDialing is whether one is
+	// being opened. connectedUDPQuietSince is when the peer, while it has a
+	// connected socket, was last found to be sent too little to keep it, or
+	// zero. See connected_udp.go.
+	connectedSocket        *connectedUDPConn
+	connectedUDPDialing    bool
+	connectedUDPQuietSince mono.Time
 
 	// The following fields are related to the new "silent disco"
 	// implementation that's a WIP as of 2022-10-20.
@@ -139,6 +149,7 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
 	if v.epAddr != de.bestAddr.epAddr {
 		de.probeUDPLifetime.resetCycleEndpointLocked()
+		de.dropConnectedUDPLocked("path changed")
 
 		// Reaching here, if we are upgrading from an invalid (missing) address
 		// to a valid one, record metrics:
@@ -581,6 +592,9 @@ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
 		// Nothing to track; src is always our DERP home.
 	} else if de.isWireguardOnly {
 		de.mu.Lock()
+		if de.bestAddr.ap != src.ap {
+			de.dropConnectedUDPLocked("peer roamed")
+		}
 		de.bestAddr.ap = src.ap
 		de.bestAddrAt = now
 		de.trustBestAddrUntil = now.Add(5 * time.Second)
@@ -698,6 +712,9 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
 		udpAddr.ap = candidates[rand.IntN(len(candidates))]
 	}
 
+	if de.bestAddr.epAddr != (epAddr{ap: udpAddr.ap}) {
+		de.dropConnectedUDPLocked("path changed")
+	}
 	de.bestAddr.epAddr = epAddr{ap: udpAddr.ap}
 	// Only extend trustBestAddrUntil by one second to avoid packet
 	// reordering and/or CPU usage from random selection during the first
@@ -898,6 +915,7 @@ func (de *endpoint) heartbeat() {
 	if now.Sub(de.lastSendExt) > sessionActiveTimeout {
 		// Session's idle. Stop heartbeating.
 		de.c.dlogf("[v1] magicsock: disco: ending heartbeats for idle session to %v (%v)", de.publicKey.ShortString(), de.discoShort())
+		de.dropConnectedUDPLocked("session idle")
 		if !buildfeatures.HasNATTraversal {
 			return
 		}
@@ -941,6 +959,9 @@ func (de *endpoint) heartbeat() {
 	if buildfeatures.HasNATTraversal && de.wantUDPRelayPathDiscoveryLocked(now) {
 		de.discoverUDPRelayPathsLocked(now)
 	}
+
+	de.checkConnectedUDPInboundLocked(now)
+	de.updateConnectedUDPLocked(now)
 
 	de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
 }
@@ -1133,6 +1154,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	de.noteTxActivityExtTriggerLocked(now)
 	de.lastSendAny = now
+	cu := de.connectedSocketForLocked(udpAddr)
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
@@ -1148,18 +1170,25 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if hasUDPTransport && udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		var txBytes int
+		for _, b := range buffs {
+			txBytes += len(b[offset:])
+		}
+
+		if cu != nil {
+			_, err = de.c.sendUDPBatchConnected(de, cu, udpAddr, buffs, offset)
+		} else {
+			_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		}
+		if err == nil && udpAddr.isDirect() {
+			de.noteConnectedUDPTx(txBytes)
+		}
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
 		// re-evaluate the best endpoint.
 		if err != nil && isBadEndpointErr(err) {
 			de.noteBadEndpoint(udpAddr)
-		}
-
-		var txBytes int
-		for _, b := range buffs {
-			txBytes += len(b[offset:])
 		}
 
 		switch {
