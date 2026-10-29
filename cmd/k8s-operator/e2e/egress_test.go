@@ -14,7 +14,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"tailscale.com/client/tailscale/v2"
 	kube "tailscale.com/k8s-operator"
@@ -102,6 +104,7 @@ func TestHAEgress(t *testing.T) {
 		})
 		createAndCleanup(t, kubeClient, svc)
 		waitForEgress(t, svc.Name, pgEgressReady)
+		requireEgressEndpointSliceFamilies(t, svc.Name, expectedEgressSliceFamilies())
 		requireTargetIsReachable(t, egressURL(svc.Name))
 	})
 
@@ -115,6 +118,7 @@ func TestHAEgress(t *testing.T) {
 		})
 		createAndCleanup(t, kubeClient, svc)
 		waitForEgress(t, svc.Name, pgEgressReady)
+		requireEgressEndpointSliceFamilies(t, svc.Name, expectedEgressSliceFamilies())
 		requireTargetIsReachable(t, egressURL(svc.Name))
 	})
 
@@ -227,6 +231,50 @@ func pgEgressReady(svc *corev1.Service) bool {
 
 func egressURL(svcName string) string {
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, ns, egressPort)
+}
+
+// expectedEgressSliceFamilies returns the EndpointSlice address families the
+// operator should provision for a given cluster.
+func expectedEgressSliceFamilies() []discoveryv1.AddressType {
+	var want []discoveryv1.AddressType
+	if clusterIPv4Support {
+		want = append(want, discoveryv1.AddressTypeIPv4)
+	}
+	if clusterIPv6Support {
+		want = append(want, discoveryv1.AddressTypeIPv6)
+	}
+	return want
+}
+
+// requireEgressEndpointSliceFamilies waits until the ClusterIP Service has an
+// EndpointSlice for each expected address family, and fails the test if they do not appear.
+func requireEgressEndpointSliceFamilies(t *testing.T, svcName string, want []discoveryv1.AddressType) {
+	t.Helper()
+	if err := tstest.WaitFor(time.Minute, func() error {
+		var slices discoveryv1.EndpointSliceList
+		if err := kubeClient.List(t.Context(), &slices,
+			client.InNamespace("tailscale"),
+			client.MatchingLabels{
+				"tailscale.com/parent-resource":    svcName,
+				"tailscale.com/parent-resource-ns": ns,
+				"tailscale.com/svc-type":           "egress",
+			},
+		); err != nil {
+			return err
+		}
+		got := make(map[discoveryv1.AddressType]bool)
+		for _, s := range slices.Items {
+			got[s.AddressType] = true
+		}
+		for _, w := range want {
+			if !got[w] {
+				return fmt.Errorf("no %s EndpointSlice for egress Service %s yet (got families %v)", w, svcName, got)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("waiting for egress EndpointSlice families %v: %v", want, err)
+	}
 }
 
 func waitForEgress(t *testing.T, svcName string, ready func(*corev1.Service) bool) {
