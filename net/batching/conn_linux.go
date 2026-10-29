@@ -55,8 +55,12 @@ var (
 // linuxBatchingConn is a UDP socket that provides batched i/o. It implements
 // [Conn].
 type linuxBatchingConn struct {
-	pc                 *net.UDPConn
-	xpc                xnetBatchReaderWriter
+	pc  *net.UDPConn
+	xpc xnetBatchReaderWriter
+	// remote is non-nil when pc is a connected socket. Writes then carry no
+	// destination address, so that the kernel uses the route (and the
+	// transmit queue) it cached on the socket at connect(2) time.
+	remote             *net.UDPAddr
 	rxOffload          bool        // supports UDP GRO or similar
 	txOffload          atomic.Bool // supports UDP GSO or similar
 	msgsPool           sync.Pool
@@ -129,7 +133,8 @@ var neverGSOEqualTailSentinelPayload = []byte{0x07}
 // All msgs[i].Buffers len must be one. Will panic if there is not enough msgs
 // to coalesce all buffs.
 //
-// All msgs have their Addr field set to addr.
+// All msgs have their Addr field set to addr. addr is nil for a connected
+// socket, in which case the address family is taken from c.remote.
 //
 // All msgs[i].Buffers[0] are preceded by a Geneve header (geneve) if geneve.VNI.IsSet().
 //
@@ -146,8 +151,12 @@ func (c *linuxBatchingConn) coalesceMessages(addr *net.UDPAddr, geneve packet.Ge
 		endBatchDueToSmallerTail bool // tracking flag to start a new batch on next iteration of buffs
 		coalescedLen             int  // bytes coalesced into msgs[base]
 	)
+	family := addr
+	if family == nil {
+		family = c.remote
+	}
 	maxPayloadLen := maxIPv4PayloadLen
-	if addr.IP.To4() == nil {
+	if family.IP.To4() == nil {
 		maxPayloadLen = maxIPv6PayloadLen
 	}
 	maxDatagramsPerGSOBatch := udpSegmentMaxDatagrams
@@ -225,11 +234,21 @@ func (c *linuxBatchingConn) coalesceMessages(addr *net.UDPAddr, geneve packet.Ge
 		gsoSize = len(buff)
 		msgs[base].OOB = msgs[base].OOB[:0]
 		msgs[base].Buffers[0] = buff
-		msgs[base].Addr = addr
+		msgs[base].Addr = destination(addr)
 		dgramCnt = 1
 		coalescedLen = len(buff)
 	}
 	return base + 1
+}
+
+// destination returns addr as a message's Addr field: a nil [net.Addr], not
+// a nil *net.UDPAddr wrapped in one, when there is no destination (a
+// connected socket). The address marshaller dereferences a typed nil.
+func destination(addr *net.UDPAddr) net.Addr {
+	if addr == nil {
+		return nil
+	}
+	return addr
 }
 
 // msgsBatch contains recyclable (via [linuxBatchingConn.msgsPool] elements
@@ -284,17 +303,28 @@ func (c *linuxBatchingConn) WriteBatchTo(buffs [][]byte, addr netip.AddrPort, ge
 	batch := c.getMsgsBatch()
 	usedMsgs := len(buffs)
 	defer c.putMsgsBatch(batch, usedMsgs)
-	if addr.Addr().Is6() {
-		as16 := addr.Addr().As16()
-		copy(batch.writeBatchToUDPAddr.IP, as16[:])
-		batch.writeBatchToUDPAddr.IP = batch.writeBatchToUDPAddr.IP[:16]
+	// dst is the per-message destination. It stays nil on a connected socket:
+	// the kernel already knows the peer, and a message without a name is what
+	// makes it use the socket's cached route and transmit queue.
+	var dst *net.UDPAddr
+	if c.remote != nil {
+		if !c.isRemote(addr) {
+			return fmt.Errorf("%w: %v is connected to %v, not %v", ErrNotConnectedTo, c.pc.LocalAddr(), c.remote, addr)
+		}
 	} else {
-		as4 := addr.Addr().As4()
-		copy(batch.writeBatchToUDPAddr.IP, as4[:])
-		batch.writeBatchToUDPAddr.IP = batch.writeBatchToUDPAddr.IP[:4]
+		dst = batch.writeBatchToUDPAddr
+		if addr.Addr().Is6() {
+			as16 := addr.Addr().As16()
+			copy(dst.IP, as16[:])
+			dst.IP = dst.IP[:16]
+		} else {
+			as4 := addr.Addr().As4()
+			copy(dst.IP, as4[:])
+			dst.IP = dst.IP[:4]
+		}
+		dst.Port = int(addr.Port())
+		dst.Zone = addr.Addr().Zone()
 	}
-	batch.writeBatchToUDPAddr.Port = int(addr.Port())
-	batch.writeBatchToUDPAddr.Zone = addr.Addr().Zone()
 	// Load the control knob once per write so a single call sees a consistent
 	// value even if the knob flips concurrently.
 	neverGSOEqualTail := c.neverGSOEqualTail != nil && c.neverGSOEqualTail.Load()
@@ -304,7 +334,7 @@ func (c *linuxBatchingConn) WriteBatchTo(buffs [][]byte, addr netip.AddrPort, ge
 	)
 retry:
 	if c.txOffload.Load() && (!neverGSOEqualTail || len(buffs) >= appendSentinelTailBatchSizeThreshold) {
-		n = c.coalesceMessages(batch.writeBatchToUDPAddr, geneve, buffs, batch.msgs, offset, neverGSOEqualTail)
+		n = c.coalesceMessages(dst, geneve, buffs, batch.msgs, offset, neverGSOEqualTail)
 	} else {
 		mutableOffset := offset // don't mutate offset across retries
 		vniIsSet := geneve.VNI.IsSet()
@@ -320,7 +350,7 @@ retry:
 			// coalesceMessages during a first pass, and landed here as part of
 			// goto retry.
 			batch.msgs[i].Buffers = batch.msgs[i].Buffers[:1]
-			batch.msgs[i].Addr = batch.writeBatchToUDPAddr
+			batch.msgs[i].Addr = destination(dst)
 			batch.msgs[i].OOB = batch.msgs[i].OOB[:0]
 		}
 		n = len(buffs)
@@ -522,7 +552,23 @@ func (c *linuxBatchingConn) LocalAddr() net.Addr {
 }
 
 func (c *linuxBatchingConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	if c.remote != nil {
+		// The standard library refuses WriteTo on a connected socket.
+		if !c.isRemote(addr) {
+			return 0, fmt.Errorf("%w: %v is connected to %v, not %v", ErrNotConnectedTo, c.pc.LocalAddr(), c.remote, addr)
+		}
+		return c.pc.Write(b)
+	}
 	return c.pc.WriteToUDPAddrPort(b, addr)
+}
+
+// isRemote reports whether addr is the peer c.remote is connected to.
+func (c *linuxBatchingConn) isRemote(addr netip.AddrPort) bool {
+	if c.remote == nil {
+		return false
+	}
+	ra := c.remote.AddrPort()
+	return netip.AddrPortFrom(ra.Addr().Unmap(), ra.Port()) == netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
 }
 
 func (c *linuxBatchingConn) Close() error {
@@ -685,6 +731,9 @@ func TryUpgradeToConn(pconn nettype.PacketConn, network string, rxqOverflowsMetr
 				}
 			},
 		},
+	}
+	if ra, ok := uc.RemoteAddr().(*net.UDPAddr); ok {
+		b.remote = ra
 	}
 	switch network {
 	case "udp4":

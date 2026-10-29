@@ -5,6 +5,7 @@
 package batching
 
 import (
+	"errors"
 	"net/netip"
 
 	"golang.org/x/net/ipv4"
@@ -80,5 +81,14 @@ type Conn interface {
 	//
 	// WriteBatchTo may return a [neterror.ErrUDPGSODisabled] error if UDP GSO
 	// was disabled as a result of a send error.
+	//
+	// If the underlying socket is connected, addr must be the address it is
+	// connected to, otherwise WriteBatchTo returns an error wrapping
+	// [ErrNotConnectedTo]. The datagrams are then sent without a destination
+	// address, so the kernel uses the route it cached at connect time.
 	WriteBatchTo(buffs [][]byte, addr netip.AddrPort, geneve packet.GeneveHeader, offset int) error
 }
+
+// ErrNotConnectedTo is returned, wrapped, by a [Conn] over a connected socket
+// when asked to write to an address other than the one it is connected to.
+var ErrNotConnectedTo = errors.New("socket is connected to a different address")
