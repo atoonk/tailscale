@@ -9,13 +9,25 @@ import (
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/envknob"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 )
 
+// debugPinSender enables wireguard-go's sender pinning: while a peer is
+// sending at a high rate, its sender goroutine is pinned to one CPU so that
+// on Linux, where XPS picks the NIC transmit queue from the sending CPU, the
+// peer's packets leave through one queue in order instead of being spread
+// over every queue and reordered on the wire. See device.WithSenderPinning.
+var debugPinSender = envknob.RegisterBool("TS_DEBUG_PIN_SENDER")
+
 // NewDevice returns a wireguard-go Device configured for Tailscale use.
 func NewDevice(tunDev tun.Device, bind conn.Bind, logger *device.Logger) *device.Device {
-	return device.NewDevice(tunDev, bind, logger, append(getMemoryOptions(), getDeviceMetrics())...)
+	opts := append(getMemoryOptions(), getDeviceMetrics())
+	if debugPinSender() {
+		opts = append(opts, device.WithSenderPinning(true))
+	}
+	return device.NewDevice(tunDev, bind, logger, opts...)
 }
 
 func getDeviceMetrics() device.Option {
@@ -27,8 +39,23 @@ func getDeviceMetrics() device.Option {
 		HandshakeInitiatorCompleted:       metricHandshakeInitiatorCompleted,
 		HandshakeResponderCompleted:       metricHandshakeResponderCompleted,
 		MessageTransportRXDroppedReplay:   metricMessageTransportRXDroppedReplay,
+		SenderPins:                        metricSenderPins,
+		SenderUnpins:                      metricSenderUnpins,
+		SenderRepins:                      metricSenderRepins,
+		SenderPinErrors:                   metricSenderPinErrors,
 	})
 }
+
+var (
+	metricSenderPins      = clientmetric.NewCounter("wireguard_sender_pins")
+	metricSenderUnpins    = clientmetric.NewCounter("wireguard_sender_unpins")
+	metricSenderRepins    = clientmetric.NewCounter("wireguard_sender_repins")
+	metricSenderPinErrors = clientmetric.NewCounter("wireguard_sender_pin_errors")
+	// metricPinnedSenders is how many peer senders are pinned right now.
+	metricPinnedSenders = clientmetric.NewGaugeFunc("wireguard_pinned_senders", func() int64 {
+		return metricSenderPins.Value() - metricSenderUnpins.Value()
+	})
+)
 
 var (
 	metricMessageInitiationTXAttemptInitial = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_initial")
